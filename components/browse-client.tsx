@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import type { RawgListResponse, RawgGameSummary } from "@/lib/rawg";
 import { GameGrid } from "@/components/game-grid";
@@ -31,6 +31,17 @@ type Filters = {
 
 const FILTER_KEYS = ["search", "ordering", "platforms", "genres", "metacritic"] as const;
 
+function readFiltersFromUrl(searchParams: URLSearchParams): Filters {
+  const get = (key: string) => searchParams.get(key) ?? "";
+  return {
+    search: get("search"),
+    ordering: get("ordering"),
+    platforms: get("platforms"),
+    genres: get("genres"),
+    metacritic: get("metacritic"),
+  };
+}
+
 function readFilters(searchParams: URLSearchParams, initialQuery: BrowseClientProps["initialQuery"]): Filters {
   const get = (key: string) =>
     searchParams.get(key) ?? initialQuery[key as keyof typeof initialQuery] ?? "";
@@ -41,6 +52,24 @@ function readFilters(searchParams: URLSearchParams, initialQuery: BrowseClientPr
     genres: get("genres"),
     metacritic: get("metacritic"),
   };
+}
+
+function buildQueryKey(input: {
+  search: string;
+  ordering: string;
+  platforms: string;
+  genres: string;
+  metacritic: string;
+  page: number;
+}): string {
+  return JSON.stringify([
+    input.search,
+    input.ordering,
+    input.platforms,
+    input.genres,
+    input.metacritic,
+    input.page,
+  ]);
 }
 
 export function BrowseClient({ initialData, initialQuery }: BrowseClientProps) {
@@ -56,23 +85,32 @@ export function BrowseClient({ initialData, initialQuery }: BrowseClientProps) {
   const [hasError, setHasError] = useState(false);
   const [activeSearch, setActiveSearch] = useState(() => readFilters(searchParams, initialQuery).search);
 
+  const urlRef = useRef(urlString);
+  const skipWriteRef = useRef(false);
+  const servedKeyRef = useRef(
+    buildQueryKey({
+      search: initialQuery.search ?? "",
+      ordering: initialQuery.ordering ?? "",
+      platforms: initialQuery.platforms ?? "",
+      genres: initialQuery.genres ?? "",
+      metacritic: initialQuery.metacritic ?? "",
+      page: Number(initialQuery.page) || 1,
+    })
+  );
+
   // Sync from URL when the browser navigates (back/forward).
   useEffect(() => {
-    let cancelled = false;
-    const sync = async () => {
-      if (cancelled) return;
-      const next = readFilters(searchParams, initialQuery);
-      setFilters((prev) =>
-        FILTER_KEYS.every((k) => prev[k] === next[k]) ? prev : next
-      );
-      setActiveSearch((prev) => (prev === next.search ? prev : next.search));
-      const urlPage = Number(searchParams.get("page")) || 1;
-      setPage((prev) => (prev === urlPage ? prev : urlPage));
-    };
-    void sync();
-    return () => {
-      cancelled = true;
-    };
+    const urlChanged = urlRef.current !== urlString;
+    urlRef.current = urlString;
+    if (!urlChanged) return;
+    skipWriteRef.current = true;
+    const next = readFiltersFromUrl(searchParams);
+    setFilters((prev) =>
+      FILTER_KEYS.every((k) => prev[k] === next[k]) ? prev : next
+    );
+    setActiveSearch((prev) => (prev === next.search ? prev : next.search));
+    const urlPage = Number(searchParams.get("page")) || 1;
+    setPage((prev) => (prev === urlPage ? prev : urlPage));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [urlString]);
 
@@ -82,6 +120,16 @@ export function BrowseClient({ initialData, initialQuery }: BrowseClientProps) {
   }, []);
 
   useEffect(() => {
+    const key = buildQueryKey({
+      search: activeSearch,
+      ordering: filters.ordering,
+      platforms: filters.platforms,
+      genres: filters.genres,
+      metacritic: filters.metacritic,
+      page,
+    });
+    if (key === servedKeyRef.current) return;
+
     let cancelled = false;
 
     const load = async () => {
@@ -100,7 +148,10 @@ export function BrowseClient({ initialData, initialQuery }: BrowseClientProps) {
         const res = await fetch(`/api/games?${params.toString()}`);
         if (!res.ok) throw new Error("request failed");
         const json = (await res.json()) as RawgListResponse;
-        if (!cancelled) setData(json);
+        if (!cancelled) {
+          servedKeyRef.current = key;
+          setData(json);
+        }
       } catch {
         if (!cancelled) setHasError(true);
       } finally {
@@ -115,8 +166,14 @@ export function BrowseClient({ initialData, initialQuery }: BrowseClientProps) {
     };
   }, [activeSearch, filters.ordering, filters.platforms, filters.genres, filters.metacritic, page]);
 
-  // Sync state -> URL.
+  // Sync state -> URL. Skipped when the URL change came from the browser
+  // (back/forward) — writing back stale state here used to clobber the URL
+  // and trigger a cascade of blocking re-renders.
   useEffect(() => {
+    if (skipWriteRef.current) {
+      skipWriteRef.current = false;
+      return;
+    }
     const params = new URLSearchParams(searchParams.toString());
     if (activeSearch) params.set("search", activeSearch);
     else params.delete("search");
